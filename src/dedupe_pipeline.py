@@ -119,96 +119,78 @@ def load_contacts(file_path: Path) -> pd.DataFrame:
 # ----------------------------------------------------------------------------
 
 def build_hierarchy_tag(df: pd.DataFrame, reference_date: Optional[datetime] = None) -> pd.DataFrame:
-    """
-    Builds a lexicographic 'hier_tag' capturing:
-      1. Privilege (owner/admin)
-      2. Primary contact flag
-      3. Active contact flag
-      4. Connection tier
-      5. Opportunity bucket
-      6. Activity tier (recent vs stale/blank)
-      7. Primary email presence bit
-      8. Connect email presence bit
-      9. Creation seniority rank
-
-    The resulting tag string sorts such that the highest-priority records
-    compare greater lexicographically.
-
-    Parameters:
-        df (pd.DataFrame): Input DataFrame with required columns.
-        reference_date (datetime, optional): Date for recency calculations.
-                                            Defaults to today's date.
-
-    Returns:
-        pd.DataFrame: Copy of input with new columns 'is_privileged' and 'hier_tag'.
-    """
     df = df.copy()
     if reference_date is None:
         reference_date = pd.Timestamp.today().normalize()
 
-    # Ensure date columns are datetime
-    df["Last Activity"] = pd.to_datetime(df["Last Activity"], errors="coerce")
-    df["Created Date"] = pd.to_datetime(df["Created Date"], errors="coerce")
+    # parse dates
+    df["Last Activity"]  = pd.to_datetime(df["Last Activity"], errors="coerce")
+    df["Created Date"]   = pd.to_datetime(df["Created Date"],  errors="coerce")
 
     # 1. Privilege bit
-    df["is_privileged"] = df["Admin Role"].str.lower().isin({"owner", "admin"})
+    df["is_privileged"]      = df["Admin Role"].str.lower().isin({"owner","admin"})
 
-    # 2. Primary contact bit
-    df["primary_bit"] = df["Primary Contact"].astype(bool).astype(int)
+    # 2. Primary contact
+    df["primary_bit"]        = df["Primary Contact"].astype(bool).astype(int)
 
-    # 3. Active contact bit
-    df["active_bit"] = df["Active Contact"].str.lower().eq("active").astype(int)
+    # 3. Active contact
+    df["active_bit"]         = df["Active Contact"].str.lower().eq("active").astype(int)
 
     # 4. Connection tier
-    df["connect_tier"] = (
-        df["ConnectLink Status"].str.upper()
-                              .map(CONNECTLINK_STATUS_TO_TIER)
-                              .fillna("1")
-    )
+    df["connect_tier"]       = df["ConnectLink Status"] \
+                                 .fillna("") \
+                                 .str.upper() \
+                                 .map(CONNECTLINK_STATUS_TO_TIER) \
+                                 .fillna("1")
 
     # 5. Opportunity bucket
     opps = df["# of opps"].fillna("0").astype(int)
-    df["opps_bucket"] = pd.cut(opps, [-1, 0, 3, float("inf")], labels=["Z", "L", "H"]).astype(str)
+    df["opps_bucket"]        = pd.cut(opps, [-1,0,3,float("inf")],
+                                      labels=["Z","L","H"]).astype(str)
 
-    # 6. Activity tier: recent (<=548 days) vs stale/blank
-    days_since_act = (reference_date - df["Last Activity"]).dt.days
-    df["activity_tier"] = pd.Series(["1"] * len(df), index=df.index)
-    recent_mask = days_since_act <= 548
-    df.loc[recent_mask, "activity_tier"] = "2"
+    # 6. Activity bucket (coarse):
+    #    2 = <= 180 days, 1 = <= 548 days, 0 = older or blank
+    days_act = (reference_date - df["Last Activity"]).dt.days.fillna(9999).astype(int)
+    df["activity_bucket"]    = pd.cut(days_act,
+                                      bins=[-1,180,548,float("inf")],
+                                      labels=["2","1","0"]
+                                     ).astype(str)
 
-    # 7. Primary email presence bit
-    df["primary_email_bit"] = df["Email"].astype(str).str.strip().ne("").astype(int)
+    # 7. Primary email presence
+    df["primary_email_bit"]  = df["Email"].astype(str).str.strip().ne("").astype(int)
 
-    # 8. Connect email presence bit
-    df["connect_email_bit"] = df["Connect Link Email"].astype(str).str.strip().ne("").astype(int)
+    # 8. Connect-link email presence
+    df["connect_email_bit"]  = df["Connect Link Email"].astype(str).str.strip().ne("").astype(int)
 
-    # 9. Creation seniority rank (days since creation, zero-padded)
-    days_since_created = (
-        reference_date - df["Created Date"]
-    ).dt.days.fillna(0).clip(0, 99999).astype(int)
-    df["created_rank"] = days_since_created.astype(str).str.zfill(5)
+    # 9. Days since last activity (exact, zero-padded)
+    exact_days = days_act.clip(0,99999).astype(int)
+    df["days_since_activity"] = exact_days.astype(str).str.zfill(5)
 
-    # Combine into hierarchy tag
+    # 10. Creation seniority rank (zero-padded days since creation)
+    days_cr = (reference_date - df["Created Date"]).dt.days.fillna(0).astype(int)
+    df["created_rank"]       = days_cr.clip(0,99999).astype(str).str.zfill(5)
+
+    # Build hier_tag in the exact order you described:
     df["hier_tag"] = (
         df["is_privileged"].astype(int).astype(str) + "|" +
-        df["primary_bit"].astype(str)       + "|" +
-        df["active_bit"].astype(str)        + "|" +
-        df["connect_tier"]                  + "|" +
-        df["opps_bucket"]                   + "|" +
-        df["activity_tier"]                 + "|" +
-        df["primary_email_bit"].astype(str)+ "|" +
-        df["connect_email_bit"].astype(str)+ "|" +
-        df["created_rank"]
+        df["primary_bit"].astype(str)        + "|" +
+        df["active_bit"].astype(str)         + "|" +
+        df["connect_tier"]                   + "|" +
+        df["opps_bucket"]                    + "|" +
+        df["activity_bucket"]                + "|" +  # coarse recency
+        df["primary_email_bit"].astype(str)  + "|" +
+        df["connect_email_bit"].astype(str)  + "|" +
+        df["days_since_activity"]            + "|" +  # fine recency
+        df["created_rank"]                      # fallback creation
     )
 
-    # Drop intermediate columns
-    df = df.drop(columns=[
-        "primary_bit", "active_bit", "connect_tier",
-        "opps_bucket", "activity_tier",
-        "primary_email_bit", "connect_email_bit", "created_rank"
+    # drop the helpers
+    return df.drop(columns=[
+        "primary_bit","active_bit","connect_tier",
+        "opps_bucket","activity_bucket",
+        "primary_email_bit","connect_email_bit",
+        "days_since_activity","created_rank"
     ])
-
-    return df
 
 # ----------------------------------------------------------------------------
 # Step 3: Normalized-Fields Preparation
@@ -632,6 +614,8 @@ def apply_one_char_off_inactivation(df: pd.DataFrame) -> pd.DataFrame:
                 i = diffs[0]
                 if full_r[i] == "@" or full_k[i] == "@":
                     df.at[idx, "resolution_status"] = "inactive"
+
+    
 
     return df
 
