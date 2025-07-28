@@ -573,6 +573,67 @@ def reassign_inactive_merges(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+# ----------------------------------------------------------------------------
+# Step 6d: Special one-char-off inactivation
+# ----------------------------------------------------------------------------
+
+def apply_one_char_off_inactivation(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Any record whose resolution_status == 'merge_exact' solely because
+    its email local-part is one Levenshtein edit away from the keep’s,
+    and that single edit is one of:
+      1) first_initial + surname_initial
+      2) first_name + surname_initial
+      3) insertion/removal of '@' in the full email
+    → mark as inactive instead.
+    """
+    from rapidfuzz.distance import Levenshtein
+
+    df = df.copy()
+    # Iterate only those merged by email-dist logic
+    mask = df["resolution_status"] == "merge_exact"
+    for idx in df[mask].index:
+        row = df.loc[idx]
+        keep = df[df["Contact Id"] == row["canonical_contact_id"]].iloc[0]
+
+        # split local parts
+        local_r, local_k = row["email_norm"].split("@")[0], keep["email_norm"].split("@")[0]
+
+        # only proceed if exactly one edit in local-part
+        if Levenshtein.distance(local_r, local_k) != 1:
+            continue
+
+        # prepare name initials
+        name_r = row["Full Name"].strip().lower().split()
+        if len(name_r) < 2:
+            continue
+        first_name, surname = name_r[0], name_r[-1]
+        fi, si = first_name[0], surname[0]
+
+        # pattern 1: local == fi + si
+        if local_r == fi + si:
+            df.at[idx, "resolution_status"] = "inactive"
+            continue
+
+        # pattern 2: local == first_name + si
+        if local_r == first_name + si:
+            df.at[idx, "resolution_status"] = "inactive"
+            continue
+
+        # pattern 3: the one edit between the FULL emails is an '@'
+        full_r, full_k = row["Email"], keep["Email"]
+        if Levenshtein.distance(full_r, full_k) == 1:
+            # locate the differing character
+            diffs = [
+                i for i, (a, b) in enumerate(zip(full_r, full_k))
+                if a != b
+            ]
+            if diffs:
+                i = diffs[0]
+                if full_r[i] == "@" or full_k[i] == "@":
+                    df.at[idx, "resolution_status"] = "inactive"
+
+    return df
 
 
 # ----------------------------------------------------------------------------
@@ -580,19 +641,22 @@ def reassign_inactive_merges(df: pd.DataFrame) -> pd.DataFrame:
 # ----------------------------------------------------------------------------
 
 def extract_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-    """
-    Constructs a feature matrix and label vector from the processed DataFrame:
-      - Numeric versions of hierarchy bits (privilege, primary, active)
-      - Numeric connect tier, opportunity bucket, activity days, creation days
-      - Name/email similarity to chosen canonical record
-      - Cluster size
-    Labels are taken from 'resolution_status' for supervised learning.
-
-    Returns:
-        X (pd.DataFrame): Feature matrix
-        y (pd.Series): Encoded labels
-    """
     df = df.copy()
+
+    # Ensure ConnectLink Status is always a string (empty if missing)
+    df["ConnectLink Status"] = df["ConnectLink Status"].fillna("").astype(str)
+    # Ensure Active Contact is always a string (empty if missing)
+    df["Active Contact"]     = df["Active Contact"].fillna("").astype(str)
+
+    # Now prep normalized fields as before
+    df = prepare_normalized_fields(df)
+    # Identify canonical per cluster…
+
+
+    # Ensure ConnectLink Status is a string (empty if missing)
+    df["ConnectLink Status"] = df["ConnectLink Status"].fillna("").astype(str)
+
+
     # Ensure name_norm and email_norm exist
     df = prepare_normalized_fields(df)
     # Identify canonical per cluster
@@ -740,6 +804,8 @@ def run_pipeline(
     df = merge_or_inactivate(df)
     df = enforce_primary_merge_threshold(df)
     df = reassign_inactive_merges(df)
+    df = apply_one_char_off_inactivation(df)
+
 
     # 6) Optional training
     if train_model_flag and model_path and encoder_path:
