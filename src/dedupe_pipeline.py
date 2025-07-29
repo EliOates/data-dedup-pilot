@@ -14,6 +14,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 from sklearn.preprocessing import LabelEncoder
 import joblib
+
 # ----------------------------------------------------------------------------
 # Configuration and Setup
 # ----------------------------------------------------------------------------
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Initialize OpenAI client (for potential embedding-based features)
 # TODO: Insert your OpenAI API key below
-os.environ["OPENAI_API_KEY"] = "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"
+os.environ["OPENAI_API_KEY"] = "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"
 openai_client = OpenAI()
 
 # Tunable thresholds for rule-based matching
@@ -222,7 +223,6 @@ def prepare_normalized_fields(df: pd.DataFrame) -> pd.DataFrame:
 # ----------------------------------------------------------------------------
 # Step 4: Duplicate‑Candidate Clustering
 # ----------------------------------------------------------------------------
-
 class UnionFind:
     """
     Union‑Find (Disjoint Set) data structure to group record indices
@@ -230,12 +230,14 @@ class UnionFind:
     """
     def __init__(self):
         self.parent: Dict[int,int] = {}
+
     def find(self, x: int) -> int:
         if x not in self.parent:
             self.parent[x] = x
         if self.parent[x] != x:
             self.parent[x] = self.find(self.parent[x])
         return self.parent[x]
+
     def union(self, x: int, y: int) -> None:
         root_x = self.find(x)
         root_y = self.find(y)
@@ -255,13 +257,14 @@ def cluster_records(
       2) One‑character‑off primary email local‑part (same domain)
       3) Exact match on name_norm
       4) Fuzzy match on name_norm (token_sort_ratio ≥ name_threshold)
-    Ignores connect_norm clustering. Blank emails are skipped in step 1.
+      5) Exact sfi_key match (surname + '_' + first initial)
+      6) LLM‑driven “neighborhood” merge for remaining singletons
     Returns a DataFrame with new column 'dupe_cluster_id'.
     """
     df = prepare_normalized_fields(df)
     uf = UnionFind()
+    llm_enabled = True
 
-    # Cluster within each account group
     for acct, grp in df.groupby("Account Name"):
         indices = list(grp.index)
 
@@ -269,14 +272,14 @@ def cluster_records(
         non_blank = grp[grp["email_norm"].ne("")]
         for _, block in non_blank.groupby("email_norm"):
             ids = list(block.index)
-            for i in ids[1:]:
-                uf.union(ids[0], i)
+            for idx in ids[1:]:
+                uf.union(ids[0], idx)
 
         # 2) One‑character‑off local‑part of primary email
         valid = non_blank[non_blank["email_norm"].str.contains("@", na=False)]
         parts = valid.assign(
-            domain = valid["email_norm"].str.split("@").str[1],
-            local  = valid["email_norm"].str.split("@").str[0]
+            domain=valid["email_norm"].str.split("@").str[1],
+            local=valid["email_norm"].str.split("@").str[0]
         )
         for _, dgrp in parts.groupby("domain"):
             idxs = list(dgrp.index)
@@ -291,8 +294,8 @@ def cluster_records(
         # 3) Exact full‑name match
         for _, block in grp.groupby("name_norm"):
             ids = list(block.index)
-            for i in ids[1:]:
-                uf.union(ids[0], i)
+            for idx in ids[1:]:
+                uf.union(ids[0], idx)
 
         # 4) Fuzzy full‑name matching
         for i in range(len(indices)):
@@ -307,13 +310,63 @@ def cluster_records(
 
         # 5) Exact sfi_key match (surname + '_' + first initial)
         for _, block in grp.groupby("sfi_key"):
-            ids = block.index.tolist()
-        for i in ids[1:]:
-            uf.union(ids[0], i)
+            ids = list(block.index)
+            for idx in ids[1:]:
+                uf.union(ids[0], idx)
 
+        # 6) LLM‑driven “neighborhood” merge for remaining singletons
+        singleton_idxs = [i for i in indices if uf.find(i) == i]
+        for idx in singleton_idxs:
+            if not llm_enabled:
+                break
+
+            pos = indices.index(idx)
+            neighborhood = indices[max(0, pos-3):pos] + indices[pos+1:pos+4]
+            name_a = df.at[idx, "Full Name"]  # use original casing
+
+            for neighbour_idx in neighborhood:
+                name_b = df.at[neighbour_idx, "Full Name"]
+                try:
+                    resp = openai_client.chat.completions.create(
+                        model="gpt-4",
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are a contact‑deduplication assistant. "
+                                    "Decide if two contact names refer to the same person "
+                                    "using common sense."
+                                )
+                            },
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Compare these two full names:\n"
+                                    f"  1) “{name_a}”\n"
+                                    f"  2) “{name_b}”\n\n"
+                                    "They may differ by typos, shortened forms, or nicknames (e.g. “Chris” vs. “Christopher”). "
+                                    "Answer strictly YES or NO."
+                                )
+                            }
+                        ]
+                    )
+                except openai.error.OpenAIError as e:
+                        # Now you can inspect e.http_status or e.code
+                    if getattr(e, "http_status", None) == 429:
+                        logger.warning("Quota hit—disabling LLM step from now on")
+                        llm_enabled = False
+                        break
+                    else:
+                        logger.warning("LLM error for %s vs %s: %s", name_a, name_b, e)
+                    continue
+
+                answer = resp.choices[0].message.content.strip().upper()
+                if answer.startswith("Y"):
+                    uf.union(idx, neighbour_idx)
+                    break
 
     # Assign stable cluster IDs
-    root_to_cid: Dict[int,str] = {}
+    root_to_cid: Dict[int, str] = {}
     cluster_ids: List[str] = []
     counter = 1
     for idx in df.index:
@@ -322,15 +375,14 @@ def cluster_records(
             root_to_cid[root] = f"C{counter:05d}"
             counter += 1
         cluster_ids.append(root_to_cid[root])
-    df["dupe_cluster_id"] = cluster_ids
 
+    df["dupe_cluster_id"] = cluster_ids
     logger.info("Assigned dupe_cluster_id to %d records", len(df))
     return df
 
-# ----------------------------------------------------------------------------
-# Step 5: Canonical Selection
-# ----------------------------------------------------------------------------
-
+    # ----------------------------------------------------------------------------
+    # Step 5: Canonical Record Selection
+    # ----------------------------------------------------------------------------
 def select_canonical(df: pd.DataFrame) -> pd.DataFrame:
     """
     Within each dupe_cluster_id group, identify the record(s) with the highest
