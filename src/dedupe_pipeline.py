@@ -16,6 +16,15 @@ from tenacity import (
 )
 import openai
 
+import re
+
+def to_ascii(s: str) -> str:
+    s = (s.replace("…", "...")
+          .replace("“", '"').replace("”", '"')
+          .replace("—", "-").replace("–", "-")
+          .replace("’", "'"))
+    return re.sub(r'[^\x00-\x7F]+', '', s)
+
 # ----------------------------------------------------------------------------
 # Safe wrapper around the OpenAI chat API with retry/backoff
 # ----------------------------------------------------------------------------
@@ -136,6 +145,12 @@ def load_contacts(file_path: Path) -> pd.DataFrame:
             )
     # Convert 'Primary Contact' to boolean
     df["Primary Contact"] = df["Primary Contact"].astype(str).str.lower().isin({"true","1","yes"})
+    # in load_contacts(), after you normalize df:
+    
+        # ─────────────── INSERT SANITIZATION HERE ───────────────
+    # Remove any non‑ASCII (e.g. hidden ellipses) from every Full Name
+    df["Full Name"] = df["Full Name"].apply(to_ascii)
+    # ──────────────────────────────────────────────────────────
 
     logger.info("Loaded and normalized %d rows", len(df))
     return df
@@ -338,15 +353,6 @@ def cluster_records(
             ids = list(block.index)
             for idx in ids[1:]:
                 uf.union(ids[0], idx)
-    import re
-
-    def to_ascii(s: str) -> str:
-        """Map common Unicode punctuation to ASCII and strip all other non-ASCII."""
-        s = (s.replace("…", "...")
-          .replace("“", '"').replace("”", '"')
-          .replace("—", "-").replace("–", "-")
-          .replace("’", "'"))
-        return re.sub(r'[^\x00-\x7F]+', '', s)
 
     # 6) LLM-driven “neighborhood” merge for remaining singletons
     singleton_idxs = [i for i in indices if uf.find(i) == i]
@@ -356,65 +362,45 @@ def cluster_records(
 
         pos = indices.index(idx)
         neighborhood = indices[max(0, pos-1):pos] + indices[pos+1:pos+2]
-
-        raw_name_a = df.at[idx, "Full Name"]
-        name_a     = to_ascii(raw_name_a)
+        name_a = df.at[idx, "Full Name"]
 
         for neighbour_idx in neighborhood:
-            raw_name_b = df.at[neighbour_idx, "Full Name"]
-            name_b     = to_ascii(raw_name_b)
-
-            # Build ASCII‑only prompts
-            system_text = to_ascii(
-                "You are a contact-deduplication assistant. "
-                "Decide if two contact names refer to the same person using common sense."
-            )
-            user_text = to_ascii(
-                f"Compare these two full names:\n"
-                f"  1) {name_a}\n"
-                f"  2) {name_b}\n\n"
-                "They may differ by typos, shortened forms, or nicknames "
-                "(e.g. Chris vs. Christopher). Answer strictly YES or NO."
-            )
+            name_b = df.at[neighbour_idx, "Full Name"]
 
         try:
             resp = safe_chat_complete(
                 model="gpt-4",
                 messages=[
-                    {"role": "system", "content": system_text},
-                    {"role": "user",   "content": user_text}
+                    {"role": "system", "content": (
+                        "You are a contact‑deduplication assistant. "
+                        "Decide if two contact names refer to the same person "
+                        "using common sense."
+                    )},
+                    {"role": "user", "content": (
+                        f"Compare these two full names:\n"
+                        f"  1) {name_a}\n"
+                        f"  2) {name_b}\n\n"
+                        "They may differ by typos, shortened forms, or nicknames "
+                        "(e.g. Chris vs. Christopher). Answer strictly YES or NO."
+                    )}
                 ]
             )
-
-            # Sanitize the LLM response before analysis
-            raw_answer = resp.choices[0].message.content
-            answer = to_ascii(raw_answer).strip().upper()
-
+            
+            answer = resp.choices[0].message.content.strip().upper()
             if answer.startswith("Y"):
                 uf.union(idx, neighbour_idx)
-                break  # matched—stop checking further neighbors
+                break  # matched
+            
 
         except openai.RateLimitError:
             logger.warning("Rate/quota limit hit — disabling LLM step")
             llm_enabled = False
-            break  # stop the neighbor loop
+            break  # stop neighbors
 
-        except Exception as e:
-            # Log using ASCII names to avoid encoding errors
-            try:
-                logger.warning("LLM error for %s vs %s: %s", name_a, name_b, to_ascii(str(e)))
-            except UnicodeEncodeError:
-                logger.warning("LLM error (encoding issue)")
+        except Exception:
+            # Generic log—no non-ASCII interpolation
+            logger.warning("LLM merge failed, skipping this pair")
             continue
-
-
-
-        answer = resp.choices[0].message.content.strip().upper()
-        if answer.startswith("Y"):
-            uf.union(idx, neighbour_idx)
-            break
-
-
 
     # Assign stable cluster IDs
     root_to_cid: Dict[int, str] = {}
