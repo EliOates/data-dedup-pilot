@@ -6,39 +6,64 @@ from typing import Optional, List, Dict, Tuple
 
 import pandas as pd
 from rapidfuzz import fuzz, distance
-from openai import OpenAI
 
+# Tenacity for retries/back‑off
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type
+)
+import openai
+
+# ----------------------------------------------------------------------------
+# Safe wrapper around the OpenAI chat API with retry/backoff
+# ----------------------------------------------------------------------------
+@retry(
+    retry=retry_if_exception_type(openai.RateLimitError),
+    wait=wait_exponential(multiplier=1, min=1, max=30),
+    stop=stop_after_attempt(5),
+    reraise=True
+)
+def safe_chat_complete(**kwargs):
+    # Delegates to your OpenAI client; will retry on RateLimitError
+    return openai_client.chat.completions.create(**kwargs)
+
+
+# ----------------------------------------------------------------------------
+# Configuration and Setup
+# ----------------------------------------------------------------------------
+import openai as _openai_core  # help editor find the package
+from openai import OpenAI       # client class
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize OpenAI client
+os.environ["OPENAI_API_KEY"] = "sk-…your_key_here…"
+openai_client = OpenAI()
+
+# Thresholds for fuzzy/rule‑based matching
+NAME_SIMILARITY_THRESHOLD     = 95
+EMAIL_EDIT_DISTANCE_THRESHOLD = 1
+
+CONNECTLINK_STATUS_TO_TIER: Dict[str,str] = {
+    "A": "3",  # Active
+    "I": "2",  # Inactive
+    "U": "2",  # Unknown→Inactive
+    "":  "1"   # Blank/Other
+}
+
+# ----------------------------------------------------------------------------
 # Additional imports for machine learning
+# ----------------------------------------------------------------------------
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 from sklearn.preprocessing import LabelEncoder
 import joblib
 
-# ----------------------------------------------------------------------------
-# Configuration and Setup
-# ----------------------------------------------------------------------------
-
-# Configure logging to show messages at INFO level and higher
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Initialize OpenAI client (for potential embedding-based features)
-# TODO: Insert your OpenAI API key below
-os.environ["OPENAI_API_KEY"] = "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"
-openai_client = OpenAI()
-
-# Tunable thresholds for rule-based matching
-NAME_SIMILARITY_THRESHOLD = 95        # Minimum similarity ratio for name fuzzy matches
-EMAIL_EDIT_DISTANCE_THRESHOLD = 1     # Maximum Levenshtein distance for email matches
-
-# Mapping of ConnectLink Status codes to lexicographic tiers
-CONNECTLINK_STATUS_TO_TIER: Dict[str, str] = {
-    "A": "3",  # Active connections
-    "I": "2",  # Inactive connections
-    "U": "2",  # Unknown treated as Inactive
-    "":  "1"   # Blank or other statuses
-}
 # ----------------------------------------------------------------------------
 # Step 1: Ingestion and Header Mapping
 # ----------------------------------------------------------------------------
@@ -313,57 +338,74 @@ def cluster_records(
             ids = list(block.index)
             for idx in ids[1:]:
                 uf.union(ids[0], idx)
+    import re
 
+    def to_ascii(s: str) -> str:
+        # Normalize fancy punctuation and strip non-ASCII
+        s = s.replace("…", "...").replace("“", '"').replace("”", '"').replace("’", "'")
+        return re.sub(r'[^\x00-\x7F]+', '', s)
+        
         # 6) LLM‑driven “neighborhood” merge for remaining singletons
-        singleton_idxs = [i for i in indices if uf.find(i) == i]
-        for idx in singleton_idxs:
-            if not llm_enabled:
-                break
+    singleton_idxs = [i for i in indices if uf.find(i) == i]
+    for idx in singleton_idxs:
+        if not llm_enabled:
+            break
 
-            pos = indices.index(idx)
-            neighborhood = indices[max(0, pos-3):pos] + indices[pos+1:pos+4]
-            name_a = df.at[idx, "Full Name"]  # use original casing
+    pos = indices.index(idx)
+    # only 1 neighbor above and 1 below
+    neighborhood = indices[max(0, pos-1):pos] + indices[pos+1:pos+2]
+    name_a = df.at[idx, "Full Name"]
 
-            for neighbour_idx in neighborhood:
-                name_b = df.at[neighbour_idx, "Full Name"]
-                try:
-                    resp = openai_client.chat.completions.create(
-                        model="gpt-4",
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You are a contact‑deduplication assistant. "
-                                    "Decide if two contact names refer to the same person "
-                                    "using common sense."
-                                )
-                            },
-                            {
-                                "role": "user",
-                                "content": (
-                                    f"Compare these two full names:\n"
-                                    f"  1) “{name_a}”\n"
-                                    f"  2) “{name_b}”\n\n"
-                                    "They may differ by typos, shortened forms, or nicknames (e.g. “Chris” vs. “Christopher”). "
-                                    "Answer strictly YES or NO."
-                                )
-                            }
-                        ]
-                    )
-                except openai.error.OpenAIError as e:
-                        # Now you can inspect e.http_status or e.code
-                    if getattr(e, "http_status", None) == 429:
-                        logger.warning("Quota hit—disabling LLM step from now on")
-                        llm_enabled = False
-                        break
-                    else:
-                        logger.warning("LLM error for %s vs %s: %s", name_a, name_b, e)
-                    continue
+    for neighbour_idx in neighborhood:
+        name_b = df.at[neighbour_idx, "Full Name"]
+        try:
+            resp = safe_chat_complete(
+                model="gpt-4",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a contact-deduplication assistant. "
+                            "Decide if two contact names refer to the same person "
+                            "using common sense."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Compare these two full names:\n"
+                            f"  1) '{name_a}'\n"
+                            f"  2) '{name_b}'\n\n"
+                            "They may differ by typos, shortened forms, or nicknames "
+                            "(e.g. Chris vs. Christopher). "
+                            "Answer strictly YES or NO."
+                        )
+                    }
+                ]
+            )
 
-                answer = resp.choices[0].message.content.strip().upper()
-                if answer.startswith("Y"):
-                    uf.union(idx, neighbour_idx)
-                    break
+            # Process the LLM’s answer only if the call succeeded
+            answer = resp.choices[0].message.content.strip().upper()
+            if answer.startswith("Y"):
+                uf.union(idx, neighbour_idx)
+                break   # stop checking more neighbors for this singleton
+
+        except openai.RateLimitError:
+            logger.warning("Rate/quota limit hit — disabling LLM step")
+            llm_enabled = False
+            break   # exit neighbor loop
+
+        except Exception as e:
+            logger.warning("LLM error for %s vs %s: %s", name_a, name_b, e)
+            continue
+
+
+        answer = resp.choices[0].message.content.strip().upper()
+        if answer.startswith("Y"):
+            uf.union(idx, neighbour_idx)
+            break
+
+
 
     # Assign stable cluster IDs
     root_to_cid: Dict[int, str] = {}

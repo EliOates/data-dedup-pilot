@@ -8,7 +8,7 @@ import dedupe_pipeline
 
 def main():
     # 1) Source data
-    input_path   = Path("Data/Contacts_Raw.xlsx")
+    input_path   = Path("Data/Contacts_LLM_Test.xlsx")
     # 2) Final output (rules + ML)
     output_path  = Path("output/Contacts_LLM_Test1.xlsx")
     # 3) Pre-trained model + encoder
