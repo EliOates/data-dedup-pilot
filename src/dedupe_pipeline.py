@@ -16,14 +16,7 @@ from tenacity import (
 )
 import openai
 
-import re
-
-def to_ascii(s: str) -> str:
-    s = (s.replace("…", "...")
-          .replace("“", '"').replace("”", '"')
-          .replace("—", "-").replace("–", "-")
-          .replace("’", "'"))
-    return re.sub(r'[^\x00-\x7F]+', '', s)
+import traceback
 
 # ----------------------------------------------------------------------------
 # Safe wrapper around the OpenAI chat API with retry/backoff
@@ -50,7 +43,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Initialize OpenAI client
-os.environ["OPENAI_API_KEY"] = "sk-…your_key_here…"
+os.environ["OPENAI_API_KEY"] = "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"
 openai_client = OpenAI()
 
 # Thresholds for fuzzy/rule‑based matching
@@ -146,11 +139,6 @@ def load_contacts(file_path: Path) -> pd.DataFrame:
     # Convert 'Primary Contact' to boolean
     df["Primary Contact"] = df["Primary Contact"].astype(str).str.lower().isin({"true","1","yes"})
     # in load_contacts(), after you normalize df:
-    
-        # ─────────────── INSERT SANITIZATION HERE ───────────────
-    # Remove any non‑ASCII (e.g. hidden ellipses) from every Full Name
-    df["Full Name"] = df["Full Name"].apply(to_ascii)
-    # ──────────────────────────────────────────────────────────
 
     logger.info("Loaded and normalized %d rows", len(df))
     return df
@@ -354,55 +342,46 @@ def cluster_records(
             for idx in ids[1:]:
                 uf.union(ids[0], idx)
 
-    # 6) LLM-driven “neighborhood” merge for remaining singletons
-    singleton_idxs = [i for i in indices if uf.find(i) == i]
-    for idx in singleton_idxs:
-        if not llm_enabled:
-            break
+   # Step 6: LLM‑driven “neighborhood” merge for this account’s singletons
+        singleton_idxs = [i for i in indices if uf.find(i) == i]
+        logger.debug("Account %s has %d singletons", acct, len(singleton_idxs))
 
-        pos = indices.index(idx)
-        neighborhood = indices[max(0, pos-1):pos] + indices[pos+1:pos+2]
-        name_a = df.at[idx, "Full Name"]
+        llm_calls = 0
+        for idx in singleton_idxs:
+            if not llm_enabled:
+                break
 
-        for neighbour_idx in neighborhood:
-            name_b = df.at[neighbour_idx, "Full Name"]
+            pos = indices.index(idx)
+            # expand to 2 above/2 below if you like
+            neighborhood = indices[max(0, pos-1):pos] + indices[pos+1:pos+2]
+            name_a = df.at[idx, "Full Name"]
 
-        try:
-            resp = safe_chat_complete(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": (
-                        "You are a contact‑deduplication assistant. "
-                        "Decide if two contact names refer to the same person "
-                        "using common sense."
-                    )},
-                    {"role": "user", "content": (
-                        f"Compare these two full names:\n"
-                        f"  1) {name_a}\n"
-                        f"  2) {name_b}\n\n"
-                        "They may differ by typos, shortened forms, or nicknames "
-                        "(e.g. Chris vs. Christopher). Answer strictly YES or NO."
-                    )}
-                ]
-            )
-            
-            answer = resp.choices[0].message.content.strip().upper()
-            if answer.startswith("Y"):
-                uf.union(idx, neighbour_idx)
-                break  # matched
-            
+            for neighbour_idx in neighborhood:
+                name_b = df.at[neighbour_idx, "Full Name"]
+                llm_calls += 1
+                logger.debug("LLM call #%d for acct %s: %s ↔ %s",
+                             llm_calls, acct, name_a, name_b)
+                try:
+                    resp = safe_chat_complete(
+                        model="gpt-4",
+                        messages=[ … your prompt … ]
+                    )
+                    answer = resp.choices[0].message.content.strip().upper()
+                    logger.debug("LLM resp #%d: %s", llm_calls, answer)
+                    if answer.startswith("Y"):
+                        uf.union(idx, neighbour_idx)
+                        break  # stop checking other neighbors
+                except openai.RateLimitError:
+                    logger.warning("Rate limit hit—disabling LLM for acct %s", acct)
+                    llm_enabled = False
+                    break
+                except Exception as e:
+                    logger.error("LLM error for %s vs %s: %s", name_a, name_b, e)
+                    continue
 
-        except openai.RateLimitError:
-            logger.warning("Rate/quota limit hit — disabling LLM step")
-            llm_enabled = False
-            break  # stop neighbors
+        logger.info("Account %s: made %d LLM calls", acct, llm_calls)
 
-        except Exception:
-            # Generic log—no non-ASCII interpolation
-            logger.warning("LLM merge failed, skipping this pair")
-            continue
-
-    # Assign stable cluster IDs
+    # After all accounts, assign cluster IDs as before…
     root_to_cid: Dict[int, str] = {}
     cluster_ids: List[str] = []
     counter = 1
@@ -412,8 +391,8 @@ def cluster_records(
             root_to_cid[root] = f"C{counter:05d}"
             counter += 1
         cluster_ids.append(root_to_cid[root])
-
     df["dupe_cluster_id"] = cluster_ids
+
     logger.info("Assigned dupe_cluster_id to %d records", len(df))
     return df
 
