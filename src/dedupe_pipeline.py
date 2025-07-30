@@ -249,15 +249,11 @@ def prepare_normalized_fields(df: pd.DataFrame) -> pd.DataFrame:
     logger.info("Prepared normalized fields for clustering")
     return df
 # ----------------------------------------------------------------------------
-# Step 4: Duplicate‑Candidate Clustering
+# Step 4 Revised: Duplicate‑Candidate Clustering + LLM Override for Singletons
 # ----------------------------------------------------------------------------
 class UnionFind:
-    """
-    Union‑Find (Disjoint Set) data structure to group record indices
-    when they satisfy blocking or fuzzy‑match rules.
-    """
     def __init__(self):
-        self.parent: Dict[int,int] = {}
+        self.parent: Dict[int, int] = {}
 
     def find(self, x: int) -> int:
         if x not in self.parent:
@@ -273,37 +269,25 @@ class UnionFind:
             self.parent[root_y] = root_x
 
 
-def cluster_records(
+def cluster_records_with_override(
     df: pd.DataFrame,
     name_threshold: int = NAME_SIMILARITY_THRESHOLD,
-    email_dist: int   = EMAIL_EDIT_DISTANCE_THRESHOLD
+    email_dist: int = EMAIL_EDIT_DISTANCE_THRESHOLD
 ) -> pd.DataFrame:
-    """
-    Assigns each record a 'dupe_cluster_id' based on these rules within each
-    Account Name:
-      1) Exact match on primary email_norm (only non‑blank emails)
-      2) One‑character‑off primary email local‑part (same domain)
-      3) Exact match on name_norm
-      4) Fuzzy match on name_norm (token_sort_ratio ≥ name_threshold)
-      5) Exact sfi_key match (surname + '_' + first initial)
-      6) LLM‑driven “neighborhood” merge for remaining singletons
-    Returns a DataFrame with new column 'dupe_cluster_id'.
-    """
+    # 0) Normalize fields
     df = prepare_normalized_fields(df)
-    uf = UnionFind()
-    llm_enabled = True
 
+    # 1) Primary clustering (skip LLM)
+    uf = UnionFind()
     for acct, grp in df.groupby("Account Name"):
         indices = list(grp.index)
-
-        # 1) Exact primary email (skip blanks)
+        # 1a) Exact email
         non_blank = grp[grp["email_norm"].ne("")]
         for _, block in non_blank.groupby("email_norm"):
             ids = list(block.index)
             for idx in ids[1:]:
                 uf.union(ids[0], idx)
-
-        # 2) One‑character‑off local‑part of primary email
+        # 1b) One-char-off email
         valid = non_blank[non_blank["email_norm"].str.contains("@", na=False)]
         parts = valid.assign(
             domain=valid["email_norm"].str.split("@").str[1],
@@ -318,82 +302,91 @@ def cluster_records(
                         dgrp.at[idxs[j], "local"]
                     ) <= email_dist:
                         uf.union(idxs[i], idxs[j])
-
-        # 3) Exact full‑name match
+        # 1c) Exact name
         for _, block in grp.groupby("name_norm"):
             ids = list(block.index)
             for idx in ids[1:]:
                 uf.union(ids[0], idx)
-
-        # 4) Fuzzy full‑name matching
+        # 1d) Fuzzy name
         for i in range(len(indices)):
             for j in range(i+1, len(indices)):
                 a, b = indices[i], indices[j]
-                if uf.find(a) != uf.find(b):
-                    if fuzz.token_sort_ratio(
-                        df.at[a, "name_norm"],
-                        df.at[b, "name_norm"]
-                    ) >= name_threshold:
-                        uf.union(a, b)
-
-        # 5) Exact sfi_key match (surname + '_' + first initial)
+                if uf.find(a) != uf.find(b) and \
+                   fuzz.token_sort_ratio(df.at[a, "name_norm"], df.at[b, "name_norm"]) >= name_threshold:
+                    uf.union(a, b)
+        # 1e) SFI key
         for _, block in grp.groupby("sfi_key"):
             ids = list(block.index)
             for idx in ids[1:]:
                 uf.union(ids[0], idx)
 
-   # Step 6: LLM‑driven “neighborhood” merge for this account’s singletons
-        singleton_idxs = [i for i in indices if uf.find(i) == i]
-        logger.debug("Account %s has %d singletons", acct, len(singleton_idxs))
-
-        llm_calls = 0
-        for idx in singleton_idxs:
-            if not llm_enabled:
-                break
-
-            pos = indices.index(idx)
-            # expand to 2 above/2 below if you like
-            neighborhood = indices[max(0, pos-1):pos] + indices[pos+1:pos+2]
-            name_a = df.at[idx, "Full Name"]
-
-            for neighbour_idx in neighborhood:
-                name_b = df.at[neighbour_idx, "Full Name"]
-                llm_calls += 1
-                logger.debug("LLM call #%d for acct %s: %s ↔ %s",
-                             llm_calls, acct, name_a, name_b)
-                try:
-                    resp = safe_chat_complete(
-                        model="gpt-4",
-                        messages=[ … your prompt … ]
-                    )
-                    answer = resp.choices[0].message.content.strip().upper()
-                    logger.debug("LLM resp #%d: %s", llm_calls, answer)
-                    if answer.startswith("Y"):
-                        uf.union(idx, neighbour_idx)
-                        break  # stop checking other neighbors
-                except openai.RateLimitError:
-                    logger.warning("Rate limit hit—disabling LLM for acct %s", acct)
-                    llm_enabled = False
-                    break
-                except Exception as e:
-                    logger.error("LLM error for %s vs %s: %s", name_a, name_b, e)
-                    continue
-
-        logger.info("Account %s: made %d LLM calls", acct, llm_calls)
-
-    # After all accounts, assign cluster IDs as before…
+    # 2) Assign initial cluster IDs
     root_to_cid: Dict[int, str] = {}
-    cluster_ids: List[str] = []
-    counter = 1
-    for idx in df.index:
-        root = uf.find(idx)
+    initial_cids: List[str] = []
+    cid_counter = 1
+    for i in df.index:
+        root = uf.find(i)
         if root not in root_to_cid:
-            root_to_cid[root] = f"C{counter:05d}"
-            counter += 1
-        cluster_ids.append(root_to_cid[root])
-    df["dupe_cluster_id"] = cluster_ids
+            root_to_cid[root] = f"C{cid_counter:05d}"
+            cid_counter += 1
+        initial_cids.append(root_to_cid[root])
+    df["dupe_cluster_id"] = initial_cids
 
-    logger.info("Assigned dupe_cluster_id to %d records", len(df))
+    # 3) Identify singletons for override
+    counts = df["dupe_cluster_id"].value_counts()
+    single_cid = counts[counts == 1].index.tolist()
+    singleton_idxs = df[df["dupe_cluster_id"].isin(single_cid)].index.tolist()
+
+    # 4) LLM override pass on singletons
+    llm_uf = UnionFind()
+    llm_enabled = True
+    llm_counter = 1
+    for idx in singleton_idxs:
+        if not llm_enabled:
+            break
+        # compare to neighborhood (prev + next singletons)
+        pos = singleton_idxs.index(idx)
+        neighbourhood = []
+        if pos > 0:
+            neighbourhood.append(singleton_idxs[pos-1])
+        if pos < len(singleton_idxs)-1:
+            neighbourhood.append(singleton_idxs[pos+1])
+        name_a = df.at[idx, "Full Name"]
+        for n_idx in neighbourhood:
+            name_b = df.at[n_idx, "Full Name"]
+            llm_counter += 1
+            try:
+                resp = safe_chat_complete(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": (
+                            "You are a contact dedupe assistant. Decide if two names are the same person. Yes or No."
+                        )},
+                        {"role": "user", "content": (
+                            f"1) {name_a}\n2) {name_b}\nAnswer YES or NO."
+                        )}
+                    ]
+                )
+                answer = resp.choices[0].message.content.strip().upper()
+                if answer.startswith("Y"):
+                    llm_uf.union(idx, n_idx)
+                    break
+            except openai.RateLimitError:
+                llm_enabled = False
+                break
+            except Exception:
+                continue
+
+    # 5) Build L-ID tags and override singletons
+    llm_root_to_lid: Dict[int, str] = {}
+    for idx in singleton_idxs:
+        root = llm_uf.find(idx)
+        if root not in llm_root_to_lid and root != idx:
+            llm_root_to_lid[root] = f"L{len(llm_root_to_lid)+1:05d}"
+        if root in llm_root_to_lid:
+            df.at[idx, "dupe_cluster_id"] = llm_root_to_lid[root]
+
+    logging.info("Applied LLM overrides to singletons")
     return df
 
     # ----------------------------------------------------------------------------
