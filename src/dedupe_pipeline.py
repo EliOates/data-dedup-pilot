@@ -341,63 +341,72 @@ def cluster_records(
     import re
 
     def to_ascii(s: str) -> str:
-        # Normalize fancy punctuation and strip non-ASCII
-        s = s.replace("…", "...").replace("“", '"').replace("”", '"').replace("’", "'")
+        """Map common Unicode punctuation to ASCII and strip all other non-ASCII."""
+        s = (s.replace("…", "...")
+          .replace("“", '"').replace("”", '"')
+          .replace("—", "-").replace("–", "-")
+          .replace("’", "'"))
         return re.sub(r'[^\x00-\x7F]+', '', s)
-        
-        # 6) LLM‑driven “neighborhood” merge for remaining singletons
+
+    # 6) LLM-driven “neighborhood” merge for remaining singletons
     singleton_idxs = [i for i in indices if uf.find(i) == i]
     for idx in singleton_idxs:
         if not llm_enabled:
             break
 
-    pos = indices.index(idx)
-    # only 1 neighbor above and 1 below
-    neighborhood = indices[max(0, pos-1):pos] + indices[pos+1:pos+2]
-    name_a = df.at[idx, "Full Name"]
+        pos = indices.index(idx)
+        neighborhood = indices[max(0, pos-1):pos] + indices[pos+1:pos+2]
 
-    for neighbour_idx in neighborhood:
-        name_b = df.at[neighbour_idx, "Full Name"]
+        raw_name_a = df.at[idx, "Full Name"]
+        name_a     = to_ascii(raw_name_a)
+
+        for neighbour_idx in neighborhood:
+            raw_name_b = df.at[neighbour_idx, "Full Name"]
+            name_b     = to_ascii(raw_name_b)
+
+            # Build ASCII‑only prompts
+            system_text = to_ascii(
+                "You are a contact-deduplication assistant. "
+                "Decide if two contact names refer to the same person using common sense."
+            )
+            user_text = to_ascii(
+                f"Compare these two full names:\n"
+                f"  1) {name_a}\n"
+                f"  2) {name_b}\n\n"
+                "They may differ by typos, shortened forms, or nicknames "
+                "(e.g. Chris vs. Christopher). Answer strictly YES or NO."
+            )
+
         try:
             resp = safe_chat_complete(
                 model="gpt-4",
                 messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a contact-deduplication assistant. "
-                            "Decide if two contact names refer to the same person "
-                            "using common sense."
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Compare these two full names:\n"
-                            f"  1) '{name_a}'\n"
-                            f"  2) '{name_b}'\n\n"
-                            "They may differ by typos, shortened forms, or nicknames "
-                            "(e.g. Chris vs. Christopher). "
-                            "Answer strictly YES or NO."
-                        )
-                    }
+                    {"role": "system", "content": system_text},
+                    {"role": "user",   "content": user_text}
                 ]
             )
 
-            # Process the LLM’s answer only if the call succeeded
-            answer = resp.choices[0].message.content.strip().upper()
+            # Sanitize the LLM response before analysis
+            raw_answer = resp.choices[0].message.content
+            answer = to_ascii(raw_answer).strip().upper()
+
             if answer.startswith("Y"):
                 uf.union(idx, neighbour_idx)
-                break   # stop checking more neighbors for this singleton
+                break  # matched—stop checking further neighbors
 
         except openai.RateLimitError:
             logger.warning("Rate/quota limit hit — disabling LLM step")
             llm_enabled = False
-            break   # exit neighbor loop
+            break  # stop the neighbor loop
 
         except Exception as e:
-            logger.warning("LLM error for %s vs %s: %s", name_a, name_b, e)
+            # Log using ASCII names to avoid encoding errors
+            try:
+                logger.warning("LLM error for %s vs %s: %s", name_a, name_b, to_ascii(str(e)))
+            except UnicodeEncodeError:
+                logger.warning("LLM error (encoding issue)")
             continue
+
 
 
         answer = resp.choices[0].message.content.strip().upper()
