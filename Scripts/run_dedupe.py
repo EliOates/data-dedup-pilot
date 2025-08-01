@@ -22,7 +22,7 @@ def main():
         output_path=output_path,
         model_path=model_path,
         encoder_path=encoder_path,
-        train_model_flag=False
+        train_model_flag=True
     )
 
 

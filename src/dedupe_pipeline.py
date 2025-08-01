@@ -15,7 +15,7 @@ from tenacity import (
     retry_if_exception_type
 )
 import openai
-
+from itertools import combinations
 import traceback
 
 # ----------------------------------------------------------------------------
@@ -48,7 +48,7 @@ openai_client = OpenAI()
 
 # Thresholds for fuzzy/rule‑based matching
 NAME_SIMILARITY_THRESHOLD     = 95
-EMAIL_EDIT_DISTANCE_THRESHOLD = 1
+EMAIL_EDIT_DISTANCE_THRESHOLD = 0
 
 CONNECTLINK_STATUS_TO_TIER: Dict[str,str] = {
     "A": "3",  # Active
@@ -118,7 +118,7 @@ def load_contacts(file_path: Path) -> pd.DataFrame:
 
     # Validate presence of all required columns
     required = [
-        "Account Name", "Full Name", "Email", "Contact Id",
+        "Account Name", "Duplicate Record Set ID", "Full Name", "Email", "Contact Id",
         "Admin Role", "Primary Contact", "Active Contact",
         "ConnectLink Status", "Connect Link Email",
         "# of cases", "# of opps", "Last Activity", "Created Date"
@@ -173,16 +173,19 @@ def build_hierarchy_tag(df: pd.DataFrame, reference_date: Optional[datetime] = N
                                  .fillna("1")
 
     # 5. Opportunity bucket
-    opps = df["# of opps"].fillna("0").astype(int)
-    df["opps_bucket"]        = pd.cut(opps, [-1,0,3,float("inf")],
-                                      labels=["Z","L","H"]).astype(str)
+    opps = df["# of opps"].replace("", 0).astype(int)
+    df["opps_bucket"] = pd.cut(
+    opps,
+    bins=[-1, 0, 3,6,float("inf")],
+    labels=["0", "1", "2", "3",],    # 0=no opps, 1=low, 2=high
+    ).astype(str)
 
     # 6. Activity bucket (coarse):
     #    2 = <= 180 days, 1 = <= 548 days, 0 = older or blank
     days_act = (reference_date - df["Last Activity"]).dt.days.fillna(9999).astype(int)
     df["activity_bucket"]    = pd.cut(days_act,
-                                      bins=[-1,180,548,float("inf")],
-                                      labels=["2","1","0"]
+                                      bins=[-1,365,1095,1825,float("inf")],
+                                      labels=["3","2","1","0"]
                                      ).astype(str)
 
     # 7. Primary email presence
@@ -191,9 +194,10 @@ def build_hierarchy_tag(df: pd.DataFrame, reference_date: Optional[datetime] = N
     # 8. Connect-link email presence
     df["connect_email_bit"]  = df["Connect Link Email"].astype(str).str.strip().ne("").astype(int)
 
-    # 9. Days since last activity (exact, zero-padded)
+    # 9. Days since last activity (inverted, zero-padded)
     exact_days = days_act.clip(0,99999).astype(int)
-    df["days_since_activity"] = exact_days.astype(str).str.zfill(5)
+    inv_days = (99999 - exact_days).astype(int)
+    df["days_since_activity"] = inv_days.astype(str).str.zfill(5)
 
     # 10. Creation seniority rank (zero-padded days since creation)
     days_cr = (reference_date - df["Created Date"]).dt.days.fillna(0).astype(int)
@@ -269,7 +273,7 @@ class UnionFind:
             self.parent[root_y] = root_x
 
 
-def cluster_records_with_override(
+def cluster_records(
     df: pd.DataFrame,
     name_threshold: int = NAME_SIMILARITY_THRESHOLD,
     email_dist: int = EMAIL_EDIT_DISTANCE_THRESHOLD
@@ -277,117 +281,135 @@ def cluster_records_with_override(
     # 0) Normalize fields
     df = prepare_normalized_fields(df)
 
-    # 1) Primary clustering (skip LLM)
+    # Initialize UnionFind
     uf = UnionFind()
-    for acct, grp in df.groupby("Account Name"):
-        indices = list(grp.index)
-        # 1a) Exact email
-        non_blank = grp[grp["email_norm"].ne("")]
-        for _, block in non_blank.groupby("email_norm"):
-            ids = list(block.index)
-            for idx in ids[1:]:
-                uf.union(ids[0], idx)
-        # 1b) One-char-off email
-        valid = non_blank[non_blank["email_norm"].str.contains("@", na=False)]
-        parts = valid.assign(
-            domain=valid["email_norm"].str.split("@").str[1],
-            local=valid["email_norm"].str.split("@").str[0]
-        )
-        for _, dgrp in parts.groupby("domain"):
-            idxs = list(dgrp.index)
-            for i in range(len(idxs)):
-                for j in range(i+1, len(idxs)):
-                    if distance.Levenshtein.distance(
-                        dgrp.at[idxs[i], "local"],
-                        dgrp.at[idxs[j], "local"]
-                    ) <= email_dist:
-                        uf.union(idxs[i], idxs[j])
-        # 1c) Exact name
-        for _, block in grp.groupby("name_norm"):
-            ids = list(block.index)
-            for idx in ids[1:]:
-                uf.union(ids[0], idx)
-        # 1d) Fuzzy name
-        for i in range(len(indices)):
-            for j in range(i+1, len(indices)):
-                a, b = indices[i], indices[j]
-                if uf.find(a) != uf.find(b) and \
-                   fuzz.token_sort_ratio(df.at[a, "name_norm"], df.at[b, "name_norm"]) >= name_threshold:
-                    uf.union(a, b)
-        # 1e) SFI key
-        for _, block in grp.groupby("sfi_key"):
-            ids = list(block.index)
-            for idx in ids[1:]:
-                uf.union(ids[0], idx)
 
-    # 2) Assign initial cluster IDs
+    # 1) Force-union by Duplicate Record Set ID (DRSID)
+    for acct, grp in df.groupby("Account Name"):
+        valid = grp["Duplicate Record Set ID"].notna() & (grp["Duplicate Record Set ID"] != "")
+        for drsid in grp.loc[valid, "Duplicate Record Set ID"].unique():
+            idxs = grp[grp["Duplicate Record Set ID"] == drsid].index.tolist()
+            for i, j in combinations(idxs, 2):
+                uf.union(i, j)
+
+    # 2) Assign initial cluster IDs (after DRSID grouping)
     root_to_cid: Dict[int, str] = {}
-    initial_cids: List[str] = []
+    seed_cids: List[str] = []
     cid_counter = 1
     for i in df.index:
         root = uf.find(i)
         if root not in root_to_cid:
             root_to_cid[root] = f"C{cid_counter:05d}"
             cid_counter += 1
-        initial_cids.append(root_to_cid[root])
-    df["dupe_cluster_id"] = initial_cids
+        seed_cids.append(root_to_cid[root])
+    df["seed_dupe_cluster_id"] = seed_cids
 
-    # 3) Identify singletons for override
+    # 3) Heuristic-based clustering rules
+    for acct, grp in df.groupby("Account Name"):
+        indices = list(grp.index)
+
+        # 3a) Exact email
+        non_blank = grp[grp["email_norm"].ne("")]
+        for _, block in non_blank.groupby("email_norm"):
+            ids = list(block.index)
+            for idx in ids[1:]:
+                uf.union(ids[0], idx)
+
+        # 3b) Exact name
+        for _, block in grp.groupby("name_norm"):
+            ids = list(block.index)
+            for idx in ids[1:]:
+                uf.union(ids[0], idx)
+
+        # 3c) Fuzzy name
+        for i in range(len(indices)):
+            for j in range(i+1, len(indices)):
+                a, b = indices[i], indices[j]
+                if uf.find(a) != uf.find(b) and \
+                   fuzz.token_sort_ratio(df.at[a, "name_norm"], df.at[b, "name_norm"]) >= name_threshold:
+                    uf.union(a, b)
+
+        # 3d) SFI key
+        for _, block in grp.groupby("sfi_key"):
+            ids = list(block.index)
+            for idx in ids[1:]:
+                uf.union(ids[0], idx)
+
+    # 4) Final cluster ID assignment (after heuristics)
+    root_to_cid.clear()
+    final_cids: List[str] = []
+    cid_counter = 1
+    for i in df.index:
+        root = uf.find(i)
+        if root not in root_to_cid:
+            root_to_cid[root] = f"C{cid_counter:05d}"
+            cid_counter += 1
+        final_cids.append(root_to_cid[root])
+    df["dupe_cluster_id"] = final_cids
+
+    # 5) Identify singletons for override
     counts = df["dupe_cluster_id"].value_counts()
     single_cid = counts[counts == 1].index.tolist()
     singleton_idxs = df[df["dupe_cluster_id"].isin(single_cid)].index.tolist()
+    logging.getLogger("dedupe_pipeline").info(f"→ {len(singleton_idxs)} singletons to consider for LLM override")
 
-    # 4) LLM override pass on singletons
+    # 6) LLM override pass on singletons
+    from itertools import chain
     llm_uf = UnionFind()
     llm_enabled = True
-    llm_counter = 1
+
     for idx in singleton_idxs:
         if not llm_enabled:
             break
-        # compare to neighborhood (prev + next singletons)
+
+        # build neighbourhood: previous and next singleton
         pos = singleton_idxs.index(idx)
-        neighbourhood = []
+        neighbours = []
         if pos > 0:
-            neighbourhood.append(singleton_idxs[pos-1])
+            neighbours.append(singleton_idxs[pos-1])
         if pos < len(singleton_idxs)-1:
-            neighbourhood.append(singleton_idxs[pos+1])
+            neighbours.append(singleton_idxs[pos+1])
+
         name_a = df.at[idx, "Full Name"]
-        for n_idx in neighbourhood:
+
+        for n_idx in neighbours:
             name_b = df.at[n_idx, "Full Name"]
-            llm_counter += 1
             try:
                 resp = safe_chat_complete(
                     model="gpt-4",
+                    temperature=0.8,
                     messages=[
-                        {"role": "system", "content": (
-                            "You are a contact dedupe assistant. Decide if two names are the same person. Yes or No."
-                        )},
-                        {"role": "user", "content": (
+                        {"role": "system", "content":
+                            "You are a contact dedupe assistant. "
+                            "Be very lenient: treat nicknames, misspellings, phonetics as same person. Yes or No."
+                        },
+                        {"role": "user", "content":
                             f"1) {name_a}\n2) {name_b}\nAnswer YES or NO."
-                        )}
+                        }
                     ]
                 )
                 answer = resp.choices[0].message.content.strip().upper()
-                if answer.startswith("Y"):
-                    llm_uf.union(idx, n_idx)
-                    break
             except openai.RateLimitError:
                 llm_enabled = False
                 break
             except Exception:
                 continue
 
-    # 5) Build L-ID tags and override singletons
-    llm_root_to_lid: Dict[int, str] = {}
+            if answer.startswith("Y"):
+                # record the LLM union
+                llm_uf.union(idx, n_idx)
+                break
+
+    # fold LLM suggestions into the main dupe_cluster_id
     for idx in singleton_idxs:
-        root = llm_uf.find(idx)
-        if root not in llm_root_to_lid and root != idx:
-            llm_root_to_lid[root] = f"L{len(llm_root_to_lid)+1:05d}"
-        if root in llm_root_to_lid:
-            df.at[idx, "dupe_cluster_id"] = llm_root_to_lid[root]
+        parent = llm_uf.find(idx)
+        if parent != idx:
+            # give idx the same cluster ID as its LLM parent
+            df.at[idx, "dupe_cluster_id"] = df.at[parent, "dupe_cluster_id"]
 
     logging.info("Applied LLM overrides to singletons")
     return df
+
 
     # ----------------------------------------------------------------------------
     # Step 5: Canonical Record Selection
@@ -862,7 +884,7 @@ def run_pipeline(
         train_and_save_model(X, y, enc, model_path, encoder_path)
 
     # 7) Optional inference
-    if model_path and encoder_path and not train_model_flag:
+    #if model_path and encoder_path and not train_model_flag:
         if model_path.exists() and encoder_path.exists():
             df = load_and_apply_model(df, model_path, encoder_path)
         else:
