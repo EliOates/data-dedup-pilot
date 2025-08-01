@@ -1,899 +1,157 @@
-import os
+#!/usr/bin/env python3
+import sys
 import logging
 from pathlib import Path
-from datetime import datetime
-from typing import Optional, List, Dict, Tuple
 
 import pandas as pd
-from rapidfuzz import fuzz, distance
-
-# Tenacity for retries/back‑off
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type
-)
-import openai
-from itertools import combinations
-import traceback
-
-# ----------------------------------------------------------------------------
-# Safe wrapper around the OpenAI chat API with retry/backoff
-# ----------------------------------------------------------------------------
-@retry(
-    retry=retry_if_exception_type(openai.RateLimitError),
-    wait=wait_exponential(multiplier=1, min=1, max=30),
-    stop=stop_after_attempt(5),
-    reraise=True
-)
-def safe_chat_complete(**kwargs):
-    # Delegates to your OpenAI client; will retry on RateLimitError
-    return openai_client.chat.completions.create(**kwargs)
-
-
-# ----------------------------------------------------------------------------
-# Configuration and Setup
-# ----------------------------------------------------------------------------
-import openai as _openai_core  # help editor find the package
-from openai import OpenAI       # client class
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Initialize OpenAI client
-os.environ["OPENAI_API_KEY"] = "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"
-openai_client = OpenAI()
-
-# Thresholds for fuzzy/rule‑based matching
-NAME_SIMILARITY_THRESHOLD     = 95
-EMAIL_EDIT_DISTANCE_THRESHOLD = 0
-
-CONNECTLINK_STATUS_TO_TIER: Dict[str,str] = {
-    "A": "3",  # Active
-    "I": "2",  # Inactive
-    "U": "2",  # Unknown→Inactive
-    "":  "1"   # Blank/Other
-}
-
-# ----------------------------------------------------------------------------
-# Additional imports for machine learning
-# ----------------------------------------------------------------------------
+from openai import OpenAI
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
-from sklearn.preprocessing import LabelEncoder
 import joblib
 
-# ----------------------------------------------------------------------------
-# Step 1: Ingestion and Header Mapping
-# ----------------------------------------------------------------------------
+# ---------------------------------------
+# Logging configuration
+# ---------------------------------------
+logging.basicConfig(
+    format='%(asctime)s %(levelname)s: %(message)s',
+    level=logging.INFO,
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
-def load_contacts(file_path: Path) -> pd.DataFrame:
-    """
-    Reads the raw Excel file of contacts, renames incoming columns to the canonical
-    schema, synthesizes 'Full Name' if needed, parses date columns, normalizes
-    key text fields, and validates that all required columns are present.
+# ---------------------------------------
+# Initialize OpenAI client
+# ---------------------------------------
+openai_client = OpenAI()
 
-    Parameters:
-        file_path (Path): Path to the input Excel file.
-
-    Returns:
-        pd.DataFrame: A DataFrame ready for deduplication steps.
-
-    Raises:
-        FileNotFoundError: If the file does not exist at the given path.
-        ValueError: If required columns are missing after processing.
-    """
-    if not file_path.exists():
-        raise FileNotFoundError(f"Input file not found: {file_path}")
-    df = pd.read_excel(file_path, engine="openpyxl", dtype=str)
-
-    # Rename upstream headers to our canonical column names
-    rename_map = {
-        "Account Name: Acct_ID_18": "Account Name",
-        "Contact_id_18":           "Contact Id",
-        "Primary Contact Any":     "Primary Contact",
-        "Agile Contact Email":     "Connect Link Email",
-        "# of Cases":              "# of cases",
-        "# of Opps":               "# of opps"
-    }
-    df = df.rename(columns=rename_map)
-
-    # Synthesize 'Full Name' if missing but First Name and Last Name exist
-    if "Full Name" not in df.columns:
-        if {"First Name", "Last Name"}.issubset(df.columns):
-            df["Full Name"] = (
-                df["First Name"].fillna("").str.strip() + " " +
-                df["Last Name"].fillna("").str.strip()
-            ).str.strip()
-        else:
-            raise ValueError("Missing both 'Full Name' and 'First Name'+'Last Name' columns")
-
-    # Parse date columns into datetime, coercing errors to NaT
-    for dt_col in ["Last Activity", "Created Date"]:
-        if dt_col in df.columns:
-            df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
-
-    # Validate presence of all required columns
-    required = [
-        "Account Name", "Duplicate Record Set ID", "Full Name", "Email", "Contact Id",
-        "Admin Role", "Primary Contact", "Active Contact",
-        "ConnectLink Status", "Connect Link Email",
-        "# of cases", "# of opps", "Last Activity", "Created Date"
-    ]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Required columns missing after ingestion: {missing}")
-
-    # Normalize text fields: fill missing with empty, collapse whitespace, strip edges
-    for col in required:
-        if df[col].dtype == object:
-            df[col] = (
-                df[col].fillna("")
-                      .astype(str)
-                      .str.strip()
-                      .str.replace(r"\s+", " ", regex=True)
-            )
-    # Convert 'Primary Contact' to boolean
-    df["Primary Contact"] = df["Primary Contact"].astype(str).str.lower().isin({"true","1","yes"})
-    # in load_contacts(), after you normalize df:
-
-    logger.info("Loaded and normalized %d rows", len(df))
-    return df
-
-# ----------------------------------------------------------------------------
-# Step 2: Hierarchy Tag Construction
-# ----------------------------------------------------------------------------
-
-def build_hierarchy_tag(df: pd.DataFrame, reference_date: Optional[datetime] = None) -> pd.DataFrame:
-    df = df.copy()
-    if reference_date is None:
-        reference_date = pd.Timestamp.today().normalize()
-
-    # parse dates
-    df["Last Activity"]  = pd.to_datetime(df["Last Activity"], errors="coerce")
-    df["Created Date"]   = pd.to_datetime(df["Created Date"],  errors="coerce")
-
-    # 1. Privilege bit
-    df["is_privileged"]      = df["Admin Role"].str.lower().isin({"owner","admin"})
-
-    # 2. Primary contact
-    df["primary_bit"]        = df["Primary Contact"].astype(bool).astype(int)
-
-    # 3. Active contact
-    df["active_bit"]         = df["Active Contact"].str.lower().eq("active").astype(int)
-
-    # 4. Connection tier
-    df["connect_tier"]       = df["ConnectLink Status"] \
-                                 .fillna("") \
-                                 .str.upper() \
-                                 .map(CONNECTLINK_STATUS_TO_TIER) \
-                                 .fillna("1")
-
-    # 5. Opportunity bucket
-    opps = df["# of opps"].replace("", 0).astype(int)
-    df["opps_bucket"] = pd.cut(
-    opps,
-    bins=[-1, 0, 3,6,float("inf")],
-    labels=["0", "1", "2", "3",],    # 0=no opps, 1=low, 2=high
-    ).astype(str)
-
-    # 6. Activity bucket (coarse):
-    #    2 = <= 180 days, 1 = <= 548 days, 0 = older or blank
-    days_act = (reference_date - df["Last Activity"]).dt.days.fillna(9999).astype(int)
-    df["activity_bucket"]    = pd.cut(days_act,
-                                      bins=[-1,365,1095,1825,float("inf")],
-                                      labels=["3","2","1","0"]
-                                     ).astype(str)
-
-    # 7. Primary email presence
-    df["primary_email_bit"]  = df["Email"].astype(str).str.strip().ne("").astype(int)
-
-    # 8. Connect-link email presence
-    df["connect_email_bit"]  = df["Connect Link Email"].astype(str).str.strip().ne("").astype(int)
-
-    # 9. Days since last activity (inverted, zero-padded)
-    exact_days = days_act.clip(0,99999).astype(int)
-    inv_days = (99999 - exact_days).astype(int)
-    df["days_since_activity"] = inv_days.astype(str).str.zfill(5)
-
-    # 10. Creation seniority rank (zero-padded days since creation)
-    days_cr = (reference_date - df["Created Date"]).dt.days.fillna(0).astype(int)
-    df["created_rank"]       = days_cr.clip(0,99999).astype(str).str.zfill(5)
-
-    # Build hier_tag in the exact order you described:
-    df["hier_tag"] = (
-        df["is_privileged"].astype(int).astype(str) + "|" +
-        df["primary_bit"].astype(str)        + "|" +
-        df["active_bit"].astype(str)         + "|" +
-        df["connect_tier"]                   + "|" +
-        df["opps_bucket"]                    + "|" +
-        df["activity_bucket"]                + "|" +  # coarse recency
-        df["primary_email_bit"].astype(str)  + "|" +
-        df["connect_email_bit"].astype(str)  + "|" +
-        df["days_since_activity"]            + "|" +  # fine recency
-        df["created_rank"]                      # fallback creation
-    )
-
-    # drop the helpers
-    return df.drop(columns=[
-        "primary_bit","active_bit","connect_tier",
-        "opps_bucket","activity_bucket",
-        "primary_email_bit","connect_email_bit",
-        "days_since_activity","created_rank"
-    ])
-
-# ----------------------------------------------------------------------------
-# Step 3: Normalized-Fields Preparation
-# ----------------------------------------------------------------------------
-
-def prepare_normalized_fields(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds helper columns for blocking and fuzzy matching:
-      • email_norm: lowercased, stripped primary email
-      • connect_norm: lowercased, stripped Connect Link email
-      • name_norm: lowercased, letters-and-spaces-only full name
-      • sfi_key: blocking key of surname + '_' + first initial
-    """
-    df = df.copy()
-    df["email_norm"]   = df["Email"].astype(str).str.lower().str.strip()
-    df["connect_norm"] = df["Connect Link Email"].astype(str).str.lower().str.strip()
-    df["name_norm"]    = (
-        df["Full Name"].astype(str)
-                      .str.lower()
-                      .str.replace(r"[^a-z ]", "", regex=True)
-                      .str.strip()
-    )
-    def make_sfi(name: str) -> str:
-        parts = name.split()
-        return "" if len(parts) < 2 else f"{parts[-1]}_{parts[0][0]}"
-    df["sfi_key"]      = df["name_norm"].apply(make_sfi)
-    logger.info("Prepared normalized fields for clustering")
-    return df
-# ----------------------------------------------------------------------------
-# Step 4 Revised: Duplicate‑Candidate Clustering + LLM Override for Singletons
-# ----------------------------------------------------------------------------
-class UnionFind:
-    def __init__(self):
-        self.parent: Dict[int, int] = {}
-
-    def find(self, x: int) -> int:
-        if x not in self.parent:
-            self.parent[x] = x
-        if self.parent[x] != x:
-            self.parent[x] = self.find(self.parent[x])
-        return self.parent[x]
-
-    def union(self, x: int, y: int) -> None:
-        root_x = self.find(x)
-        root_y = self.find(y)
-        if root_x != root_y:
-            self.parent[root_y] = root_x
-
-
-def cluster_records(
-    df: pd.DataFrame,
-    name_threshold: int = NAME_SIMILARITY_THRESHOLD,
-    email_dist: int = EMAIL_EDIT_DISTANCE_THRESHOLD
+# ---------------------------------------
+# Load reviewed labels
+# ---------------------------------------
+def load_manual_labels(
+    review_path: Path,
+    label_column: str = 'manual_label'
 ) -> pd.DataFrame:
-    # 0) Normalize fields
-    df = prepare_normalized_fields(df)
+    """
+    Load the reviewed Excel file and normalize the manual label column.
+    """
+    if not review_path.exists():
+        logger.error("Review file not found: %s", review_path)
+        raise FileNotFoundError(f"Review file not found: {review_path}")
 
-    # Initialize UnionFind
-    uf = UnionFind()
+    df = pd.read_excel(review_path, engine='openpyxl', dtype=str)
+    # Case-insensitive lookup of label column
+    mapping = {col.lower(): col for col in df.columns}
+    matched = mapping.get(label_column.lower())
+    if not matched:
+        logger.error("Available columns in review file: %s", list(df.columns))
+        raise ValueError(f"Column '{label_column}' not found in {review_path}")
 
-    # 1) Force-union by Duplicate Record Set ID (DRSID)
-    for acct, grp in df.groupby("Account Name"):
-        valid = grp["Duplicate Record Set ID"].notna() & (grp["Duplicate Record Set ID"] != "")
-        for drsid in grp.loc[valid, "Duplicate Record Set ID"].unique():
-            idxs = grp[grp["Duplicate Record Set ID"] == drsid].index.tolist()
-            for i, j in combinations(idxs, 2):
-                uf.union(i, j)
-
-    # 2) Assign initial cluster IDs (after DRSID grouping)
-    root_to_cid: Dict[int, str] = {}
-    seed_cids: List[str] = []
-    cid_counter = 1
-    for i in df.index:
-        root = uf.find(i)
-        if root not in root_to_cid:
-            root_to_cid[root] = f"C{cid_counter:05d}"
-            cid_counter += 1
-        seed_cids.append(root_to_cid[root])
-    df["seed_dupe_cluster_id"] = seed_cids
-
-    # 3) Heuristic-based clustering rules
-    for acct, grp in df.groupby("Account Name"):
-        indices = list(grp.index)
-
-        # 3a) Exact email
-        non_blank = grp[grp["email_norm"].ne("")]
-        for _, block in non_blank.groupby("email_norm"):
-            ids = list(block.index)
-            for idx in ids[1:]:
-                uf.union(ids[0], idx)
-
-        # 3b) Exact name
-        for _, block in grp.groupby("name_norm"):
-            ids = list(block.index)
-            for idx in ids[1:]:
-                uf.union(ids[0], idx)
-
-        # 3c) Fuzzy name
-        for i in range(len(indices)):
-            for j in range(i+1, len(indices)):
-                a, b = indices[i], indices[j]
-                if uf.find(a) != uf.find(b) and \
-                   fuzz.token_sort_ratio(df.at[a, "name_norm"], df.at[b, "name_norm"]) >= name_threshold:
-                    uf.union(a, b)
-
-        # 3d) SFI key
-        for _, block in grp.groupby("sfi_key"):
-            ids = list(block.index)
-            for idx in ids[1:]:
-                uf.union(ids[0], idx)
-
-    # 4) Final cluster ID assignment (after heuristics)
-    root_to_cid.clear()
-    final_cids: List[str] = []
-    cid_counter = 1
-    for i in df.index:
-        root = uf.find(i)
-        if root not in root_to_cid:
-            root_to_cid[root] = f"C{cid_counter:05d}"
-            cid_counter += 1
-        final_cids.append(root_to_cid[root])
-    df["dupe_cluster_id"] = final_cids
-
-    # 5) Identify singletons for override
-    counts = df["dupe_cluster_id"].value_counts()
-    single_cid = counts[counts == 1].index.tolist()
-    singleton_idxs = df[df["dupe_cluster_id"].isin(single_cid)].index.tolist()
-    logging.getLogger("dedupe_pipeline").info(f"→ {len(singleton_idxs)} singletons to consider for LLM override")
-
-    # 6) LLM override pass on singletons
-    from itertools import chain
-    llm_uf = UnionFind()
-    llm_enabled = True
-
-    for idx in singleton_idxs:
-        if not llm_enabled:
-            break
-
-        # build neighbourhood: previous and next singleton
-        pos = singleton_idxs.index(idx)
-        neighbours = []
-        if pos > 0:
-            neighbours.append(singleton_idxs[pos-1])
-        if pos < len(singleton_idxs)-1:
-            neighbours.append(singleton_idxs[pos+1])
-
-        name_a = df.at[idx, "Full Name"]
-
-        for n_idx in neighbours:
-            name_b = df.at[n_idx, "Full Name"]
-            try:
-                resp = safe_chat_complete(
-                    model="gpt-4",
-                    temperature=0.8,
-                    messages=[
-                        {"role": "system", "content":
-                            "You are a contact dedupe assistant. "
-                            "Be very lenient: treat nicknames, misspellings, phonetics as same person. Yes or No."
-                        },
-                        {"role": "user", "content":
-                            f"1) {name_a}\n2) {name_b}\nAnswer YES or NO."
-                        }
-                    ]
-                )
-                answer = resp.choices[0].message.content.strip().upper()
-            except openai.RateLimitError:
-                llm_enabled = False
-                break
-            except Exception:
-                continue
-
-            if answer.startswith("Y"):
-                # record the LLM union
-                llm_uf.union(idx, n_idx)
-                break
-
-    # fold LLM suggestions into the main dupe_cluster_id
-    for idx in singleton_idxs:
-        parent = llm_uf.find(idx)
-        if parent != idx:
-            # give idx the same cluster ID as its LLM parent
-            df.at[idx, "dupe_cluster_id"] = df.at[parent, "dupe_cluster_id"]
-
-    logging.info("Applied LLM overrides to singletons")
+    # Normalize and rename
+    df = df.rename(columns={matched: label_column})
+    df[label_column] = df[label_column].fillna(pd.NA)
     return df
 
-
-    # ----------------------------------------------------------------------------
-    # Step 5: Canonical Record Selection
-    # ----------------------------------------------------------------------------
-def select_canonical(df: pd.DataFrame) -> pd.DataFrame:
+# ---------------------------------------
+# Merge labels into full dataset
+# ---------------------------------------
+def integrate_manual_labels(
+    df_full: pd.DataFrame,
+    df_labeled: pd.DataFrame,
+    key_columns: list[str],
+    label_column: str = 'manual_label'
+) -> pd.DataFrame:
     """
-    Within each dupe_cluster_id group, identify the record(s) with the highest
-    'hier_tag'. If there is exactly one such record, mark it as 'keep'. If there
-    are multiple tied at the top tag, mark them 'keep_tie'. All other records
-    get marked 'merge' and pointed at the chosen canonical Contact Id.
-
-    Returns:
-        pd.DataFrame: Copy of input with new columns:
-          - is_canonical (bool)
-          - canonical_contact_id (str)
-          - resolution_status (str)
+    Merge manual labels into the full DataFrame on key_columns.
     """
-    df = df.copy()
-    df["is_canonical"] = False
-    df["canonical_contact_id"] = None
-    df["resolution_status"] = None
-
-    def pick_top(sub: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        sorted_sub = sub.sort_values("hier_tag", ascending=False)
-        top_tag = sorted_sub.iloc[0]["hier_tag"]
-        tied = sorted_sub[sorted_sub["hier_tag"] == top_tag]
-        return tied, sorted_sub
-
-    for cluster_id, group in df.groupby("dupe_cluster_id"):
-        tied, sorted_group = pick_top(group)
-        if len(tied) > 1:
-            # Multiple top-tier records: all are kept, others merged
-            for idx in tied.index:
-                df.at[idx, "is_canonical"] = True
-                df.at[idx, "canonical_contact_id"] = df.at[idx, "Contact Id"]
-                df.at[idx, "resolution_status"] = "keep_tie"
-            loser_idx = sorted_group.index.difference(tied.index)
-            for idx in loser_idx:
-                df.at[idx, "canonical_contact_id"] = tied.iloc[0]["Contact Id"]
-                df.at[idx, "resolution_status"] = "merge"
-        else:
-            # Single winner: keep it, merge the rest
-            winner_idx = tied.index[0]
-            df.at[winner_idx, "is_canonical"] = True
-            df.at[winner_idx, "canonical_contact_id"] = df.at[winner_idx, "Contact Id"]
-            df.at[winner_idx, "resolution_status"] = "keep"
-            loser_idx = sorted_group.index.difference([winner_idx])
-            for idx in loser_idx:
-                df.at[idx, "canonical_contact_id"] = df.at[winner_idx, "Contact Id"]
-                df.at[idx, "resolution_status"] = "merge"
-    logger.info("Selected canonical records")
-    return df
-# ----------------------------------------------------------------------------
-# Step 6: Merge or Inactivate
-# ----------------------------------------------------------------------------
-
-def merge_or_inactivate(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    For each record not marked canonical, applies merge/inactivate logic uniformly,
-    with:
-      • special handling when the keep has a blank primary email (unchanged),
-      • and in the standard case (keep has a primary), merges only on primary→primary
-        (exact or Levenshtein ≤ threshold) and immediately inactivates any other non-blank.
-    """
-    df = df.copy()
-
-    # 1) Privileged safeguard
-    priv = df["is_privileged"]
-    df.loc[priv, "is_canonical"]          = True
-    df.loc[priv, "canonical_contact_id"]  = df.loc[priv, "Contact Id"]
-    df.loc[priv, "resolution_status"]     = "keep_privileged"
-
-    # 2) Gather canonical info per cluster
-    canonals: Dict[str, List[Dict[str,str]]] = {}
-    for cid, grp in df[df["is_canonical"]].groupby("dupe_cluster_id"):
-        canonals[cid] = [{
-            "primary":      df.at[idx, "email_norm"],
-            "connect":      df.at[idx, "connect_norm"],
-            "name":         df.at[idx, "name_norm"],
-            "contact_id":   df.at[idx, "Contact Id"],
-            "hier_tag":     df.at[idx, "hier_tag"]
-        } for idx in grp.index]
-
-    # 3) Identify candidates
-    candidates: Dict[str,List[int]] = {}
-    for cid, grp in df.groupby("dupe_cluster_id"):
-        lst = [i for i in grp.index
-               if not df.at[i,"is_canonical"] and not df.at[i,"is_privileged"]]
-        if lst:
-            candidates[cid] = lst
-
-    # 4) Special‑case: keep with blank primary email (unchanged)
-    for cid, cans in candidates.items():
-        keeps = canonals.get(cid, [])
-        if len(keeps)==1 and keeps[0]["primary"] == "":
-            keep_id = keeps[0]["contact_id"]
-            # single candidate → merge
-            if len(cans)==1:
-                df.at[cans[0], "resolution_status"]        = "merge_exact"
-                df.at[cans[0], "canonical_contact_id"]    = keep_id
-                continue
-            # multiple candidates → choose by connect match or hier_tag
-            keep_con = keeps[0]["connect"]
-            # 4a) primary==keep.connect
-            prim = [i for i in cans if df.at[i,"email_norm"] == keep_con]
-            if len(prim)==1:
-                winner = prim[0]
-            elif prim:
-                winner = max(prim, key=lambda i: df.at[i,"hier_tag"])
-            else:
-                # 4b) connect==keep.connect
-                conn = [i for i in cans if df.at[i,"connect_norm"] == keep_con]
-                if len(conn)==1:
-                    winner = conn[0]
-                elif conn:
-                    winner = max(conn, key=lambda i: df.at[i,"hier_tag"])
-                else:
-                    winner = max(cans, key=lambda i: df.at[i,"hier_tag"])
-            # apply merges/inactivations
-            for i in cans:
-                if i == winner:
-                    df.at[i, "resolution_status"]        = "merge_exact"
-                    df.at[i, "canonical_contact_id"]    = keep_id
-                else:
-                    df.at[i, "resolution_status"]        = "inactive"
-                    df.at[i, "canonical_contact_id"]    = None
-            continue
-
-    # 5) Standard logic: keep has a primary email
-    for idx, row in df[(~df["is_canonical"]) & (~df["is_privileged"])].iterrows():
-        # skip if already set
-        if pd.notna(row["resolution_status"]):
-            continue
-
-        cid      = row["dupe_cluster_id"]
-        S        = canonals.get(cid, [])
-        if not S:
-            continue
-
-        keep_pri = S[0]["primary"]
-        r_pri    = row["email_norm"]
-
-        # 5a) If keep_pri is non-blank, only merge on primary→primary (exact or one-char-off)
-        if keep_pri:
-            if r_pri:
-                dist = distance.Levenshtein.distance
-                if r_pri == keep_pri or dist(r_pri, keep_pri) <= EMAIL_EDIT_DISTANCE_THRESHOLD:
-                    df.at[idx, "resolution_status"]       = "merge_exact"
-                    df.at[idx, "canonical_contact_id"]   = S[0]["contact_id"]
-                else:
-                    df.at[idx, "resolution_status"]       = "inactive"
-                continue
-            # else r_pri is blank → fall through to name logic
-
-        # 5b) Name-based for truly blank primary
-        matched = False
-        for C in S:
-            if row["name_norm"] == C["name"]:
-                df.at[idx, "resolution_status"]       = "merge_name_exact"
-                df.at[idx, "canonical_contact_id"]   = C["contact_id"]
-                matched = True
-                break
-        if matched:
-            continue
-
-        for C in S:
-            if fuzz.token_sort_ratio(row["name_norm"], C["name"]) >= NAME_SIMILARITY_THRESHOLD:
-                df.at[idx, "resolution_status"]       = "merge_name_fuzzy"
-                df.at[idx, "canonical_contact_id"]   = C["contact_id"]
-                matched = True
-                break
-        if not matched:
-            df.at[idx, "resolution_status"] = "WIP"
-
-    logger.info("Applied updated merge/inactivate logic")
-    return df
-
-def enforce_primary_merge_threshold(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Post‑check: for any row that was merged (merge_exact, merge_name_*, etc.),
-    if its primary email_norm and its keep’s email_norm differ by >1 char,
-    mark it inactive instead.
-    """
-    df = df.copy()
-    # build lookup of Contact Id → keep’s primary email_norm
-    keep_email = df[df["is_canonical"]].set_index("Contact Id")["email_norm"].to_dict()
-    thresh = EMAIL_EDIT_DISTANCE_THRESHOLD
-    dist   = distance.Levenshtein.distance
-
-    for idx, row in df[df["resolution_status"].str.startswith("merge")].iterrows():
-        r_pri = row["email_norm"]
-        keep_id = row["canonical_contact_id"]
-        c_pri = keep_email.get(keep_id, "")
-        # only enforce on non‑blank primaries
-        if r_pri and c_pri and dist(r_pri, c_pri) > thresh:
-            df.at[idx, "resolution_status"] = "inactive"
-    return df
-
-# ----------------------------------------------------------------------------
-# Step 6c: Re‑assign exact‑email inactives back to merge_exact
-# ----------------------------------------------------------------------------
-
-def reassign_inactive_merges(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Any row marked 'inactive' but whose primary email_norm exactly matches
-    a keep's primary email_norm in the same dupe_cluster_id will be flipped
-    to 'merge_exact' against that keep.
-    """
-    df = df.copy()
-
-    # Build lookup: (dupe_cluster_id, primary_email) -> keep Contact Id
-    keep_lookup = (
-        df[df["is_canonical"] & df["email_norm"].ne("")]
-          .groupby(["dupe_cluster_id", "email_norm"])["Contact Id"]
-          .first()
-          .to_dict()
+    merged = df_full.merge(
+        df_labeled[key_columns + [label_column]],
+        on=key_columns,
+        how='left'
     )
+    return merged
 
-    # Find all inactive rows with a non‑blank primary email
-    mask = (df["resolution_status"] == "inactive") & df["email_norm"].ne("")
-    for idx in df[mask].index:
-        key = (df.at[idx, "dupe_cluster_id"], df.at[idx, "email_norm"])
-        if key in keep_lookup:
-            df.at[idx, "resolution_status"]      = "merge_exact"
-            df.at[idx, "canonical_contact_id"]   = keep_lookup[key]
-
-    return df
-
-# ----------------------------------------------------------------------------
-# Step 6d: Special one-char-off inactivation
-# ----------------------------------------------------------------------------
-
-def apply_one_char_off_inactivation(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Any record whose resolution_status == 'merge_exact' solely because
-    its email local-part is one Levenshtein edit away from the keep’s,
-    and that single edit is one of:
-      1) first_initial + surname_initial
-      2) first_name + surname_initial
-      3) insertion/removal of '@' in the full email
-      4) insertion or deletion of one character at the beginning or end of the local-part
-      5) insertion of a single numeric character in the local-part
-    → mark as inactive instead.
-    """
-    from rapidfuzz.distance import Levenshtein
-
-    df = df.copy()
-    mask = df["resolution_status"] == "merge_exact"
-    for idx in df[mask].index:
-        row = df.loc[idx]
-        keep = df[df["Contact Id"] == row["canonical_contact_id"]].iloc[0]
-
-        # split local parts
-        local_r = row["email_norm"].split("@")[0]
-        local_k = keep["email_norm"].split("@")[0]
-
-        # only proceed if exactly one edit in local-part
-        if Levenshtein.distance(local_r, local_k) != 1:
-            continue
-
-        # pattern 1: initials match (fi + si)
-        name_r = row["Full Name"].strip().lower().split()
-        if len(name_r) >= 2:
-            first_name, surname = name_r[0], name_r[-1]
-            fi, si = first_name[0], surname[0]
-            if local_r in {fi + si, first_name + si}:
-                df.at[idx, "resolution_status"] = "inactive"
-                continue
-
-        # pattern 3: single '@' insertion/deletion in full email
-        full_r, full_k = row["Email"], keep["Email"]
-        if Levenshtein.distance(full_r, full_k) == 1:
-            diffs = [i for i, (a, b) in enumerate(zip(full_r, full_k)) if a != b]
-            if diffs and (full_r[diffs[0]] == "@" or full_k[diffs[0]] == "@"):
-                df.at[idx, "resolution_status"] = "inactive"
-                continue
-
-        # pattern 4: one-char boundary insertion/deletion
-        #    e.g. "jdoe" ↔ "ajdoe" or "jdoe" ↔ "jdoex"
-        if abs(len(local_r) - len(local_k)) == 1:
-            longer, shorter = (local_r, local_k) if len(local_r) > len(local_k) else (local_k, local_r)
-            if longer[1:] == shorter or longer[:-1] == shorter:
-                df.at[idx, "resolution_status"] = "inactive"
-                continue
-
-        # pattern 5: single numeric insertion anywhere
-        #    e.g. "jdoe" ↔ "jdoe1"
-        if len(local_r) - len(local_k) == 1:
-            # row has the extra char
-            for i, ch in enumerate(local_r):
-                if ch.isdigit() and (local_r[:i] + local_r[i+1:]) == local_k:
-                    df.at[idx, "resolution_status"] = "inactive"
-                    break
-
-    return df
-
-
-# ----------------------------------------------------------------------------
-# Step 7: Feature Engineering for Machine Learning
-# ----------------------------------------------------------------------------
-
-def extract_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-    df = df.copy()
-
-    # Ensure ConnectLink Status is always a string (empty if missing)
-    df["ConnectLink Status"] = df["ConnectLink Status"].fillna("").astype(str)
-    # Ensure Active Contact is always a string (empty if missing)
-    df["Active Contact"]     = df["Active Contact"].fillna("").astype(str)
-
-    # Now prep normalized fields as before
-    df = prepare_normalized_fields(df)
-    # Identify canonical per cluster…
-
-
-    # Ensure ConnectLink Status is a string (empty if missing)
-    df["ConnectLink Status"] = df["ConnectLink Status"].fillna("").astype(str)
-
-
-    # Ensure name_norm and email_norm exist
-    df = prepare_normalized_fields(df)
-    # Identify canonical per cluster
-    canon_map: Dict[str, Dict[str, str]] = {}
-    for cid, group in df[df["is_canonical"]].groupby("dupe_cluster_id"):
-        canon_map[cid] = {
-            "email_norm": group.iloc[0]["email_norm"],
-            "name_norm":  group.iloc[0]["name_norm"]
-        }
-    # Compute features
-    feature_dicts: List[Dict[str, float]] = []
-    labels: List[str] = []
-    for idx, row in df.iterrows():
-        cid = row["dupe_cluster_id"]
-        canon_vals = canon_map.get(cid, {"email_norm":"","name_norm":""})
-        # Hierarchy bits
-        feat: Dict[str, float] = {}
-        feat["is_privileged"] = float(row["is_privileged"])
-        feat["primary_bit"]    = float(row["Primary Contact"])
-        feat["active_bit"]     = float(row["Active Contact"].lower()=="active")
-        # Connect tier numeric
-        feat["connect_tier"]   = float(CONNECTLINK_STATUS_TO_TIER.get(row["ConnectLink Status"].upper(), "1"))
-        # Opportunity bucket numeric
-        opps = int(row["# of opps"] or 0)
-        feat["opps_bucket"]    = float(0 if opps==0 else 1 if opps<=3 else 2)
-        # Activity recency days
-        days_act = (pd.Timestamp.today().normalize() - row["Last Activity"]).days if pd.notna(row["Last Activity"]) else 0
-        feat["days_since_activity"] = float(days_act)
-        # Creation seniority days
-        days_cr = (pd.Timestamp.today().normalize() - row["Created Date"]).days if pd.notna(row["Created Date"]) else 0
-        feat["days_since_created"] = float(days_cr)
-        # Similarities to canonical
-        feat["name_similarity"] = float(fuzz.token_sort_ratio(row["name_norm"], canon_vals["name_norm"]))
-        feat["email_edit_dist"] = float(distance.Levenshtein.distance(row["email_norm"], canon_vals["email_norm"]))
-        # Cluster size
-        feat["cluster_size"]    = float(len(df[df["dupe_cluster_id"]==cid]))
-        feature_dicts.append(feat)
-        labels.append(row["resolution_status"])
-    X = pd.DataFrame(feature_dicts)
-    # Encode string labels to integers
-    encoder = LabelEncoder()
-    y = encoder.fit_transform(labels)
-    # Persist label encoder for inference
-    df_label_enc = pd.DataFrame({"label": labels})
-    return X, pd.Series(y), encoder
-
-# ----------------------------------------------------------------------------
-# Step 8: Model Training, Evaluation, Saving
-# ----------------------------------------------------------------------------
-
-def train_and_save_model(
-    X: pd.DataFrame,
-    y: pd.Series,
-    encoder: LabelEncoder,
+# ---------------------------------------
+# Retrain model with manual labels
+# ---------------------------------------
+def retrain_model_with_labels(
+    merged_df: pd.DataFrame,
+    feature_extractor,
     model_path: Path,
     encoder_path: Path
 ) -> None:
     """
-    Splits features and labels into train/test, trains a RandomForest classifier,
-    evaluates performance, and saves both the trained model and label encoder.
+    Retrain a RandomForest classifier on manually labeled rows.
     """
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-    clf = RandomForestClassifier(n_estimators=100, random_state=42)
-    clf.fit(X_train, y_train)
+    # Filter to manually labeled rows
+    train_df = merged_df.dropna(subset=['manual_label']).copy()
+    if train_df.empty:
+        logger.warning("No manual labels found; skipping retrain.")
+        return
 
-    y_pred = clf.predict(X_test)
-    report = classification_report(y_test, y_pred)
-    logger.info("Model evaluation:\n%s", report)
+    # Ensure boolean is_canonical column for feature extraction
+    if 'is_canonical' in train_df.columns:
+        train_df['is_canonical'] = train_df['is_canonical'].apply(
+            lambda x: str(x).lower() in ('true', '1', 'yes')
+        )
+    # Use manual_label as the target resolution_status
+    train_df['resolution_status'] = train_df['manual_label']
+
+    # Extract features and labels
+    X, y, encoder = feature_extractor(train_df)
+    clf = RandomForestClassifier(n_estimators=100, random_state=42)
+
+    # Train/test split with stratify
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        clf.fit(X_train, y_train)
+        y_pred = clf.predict(X_test)
+        logger.info("Retrain evaluation:\n%s", classification_report(y_test, y_pred))
+    except ValueError as e:
+        logger.warning("Stratified split failed (%s); training on full set.", e)
+        clf.fit(X, y)
 
     # Save model and encoder
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    encoder_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(clf, model_path)
     joblib.dump(encoder, encoder_path)
-    logger.info("Saved trained model to %s and encoder to %s", model_path, encoder_path)
+    logger.info("Retrained model saved to %s and encoder to %s", model_path, encoder_path)
 
-# ----------------------------------------------------------------------------
-# Step 9: Model Loading and Inference
-# ----------------------------------------------------------------------------
+# ---------------------------------------
+# Main pipeline
+# ---------------------------------------
+def main():
+    logger.info("Starting Active Learning Pipeline…")
+    root = Path(__file__).parent.parent
+    output_file = root / 'output' / 'Contacts_LLM_Test1.xlsx'
 
-def load_and_apply_model(
-    df: pd.DataFrame,
-    model_path: Path,
-    encoder_path: Path
-) -> pd.DataFrame:
-    """
-    Loads a saved classifier and label encoder, computes features for the DataFrame,
-    predicts resolution_status for each record, and appends a new column
-    'ml_resolution_status' with the decoded predictions.
-    """
-    # Load model and encoder
-    clf: RandomForestClassifier = joblib.load(model_path)
-    encoder: LabelEncoder = joblib.load(encoder_path)
+    # 1) Load full ML output
+    df_full = pd.read_excel(output_file, engine='openpyxl', dtype=str)
 
-    # Extract features (we discard the returned encoder)
-    X, _, _ = extract_features(df)
-    y_pred = clf.predict(X)
-    decoded = encoder.inverse_transform(y_pred)
+    # Coerce is_canonical to boolean if present (string -> bool)
+    if 'is_canonical' in df_full.columns:
+        df_full['is_canonical'] = df_full['is_canonical'].apply(
+            lambda x: str(x).lower() in ('true','1','yes')
+        )
 
-    df = df.copy()
-    df["ml_resolution_status"] = decoded
-    logger.info("Applied ML model to %d records", len(df))
-    return df
-# ----------------------------------------------------------------------------
-# Full Pipeline Invocation (Definition Only)
-# ----------------------------------------------------------------------------
-# ----------------------------------------------------------------------------
-# Full Pipeline Invocation
-# ----------------------------------------------------------------------------
+    # 2) Load manual labels
+    df_reviewed = load_manual_labels(output_file, label_column='manual_label')
 
-def run_pipeline(
-    input_path: Path,
-    output_path: Path,
-    model_path: Optional[Path]   = None,
-    encoder_path: Optional[Path] = None,
-    train_model_flag: bool       = False
-) -> pd.DataFrame:
-    """
-    Executes the full deduplication pipeline:
-      1) Load and normalize contacts
-      2) Build hierarchy tags
-      3) Cluster duplicate candidates
-      4) Select canonical records
-      5) Merge or inactivate other records
-      6) Optional: train an RF model if train_model_flag=True
-      7) Optional: apply an existing model for ML-based status
-      8) Export results to Excel
+    # 3) Merge
+    merged = integrate_manual_labels(
+        df_full, df_reviewed, key_columns=['Contact Id'], label_column='manual_label'
+    )
 
-    Returns:
-        pd.DataFrame: DataFrame of final results.
-    """
-    # 1) Ingest
-    df = load_contacts(input_path)
-
-    # 2) Hierarchy tagging
-    df = build_hierarchy_tag(df)
-
-    # 3) Duplicate clustering
-    df = cluster_records(df)
-
-    # 4) Canonical selection
-    df = select_canonical(df)
-
-    # 5) Merge or inactivate
-    df = merge_or_inactivate(df)
-    df = enforce_primary_merge_threshold(df)
-    df = reassign_inactive_merges(df)
-    df = apply_one_char_off_inactivation(df)
-
-
-    # 6) Optional training
-    if train_model_flag and model_path and encoder_path:
-        X, y, enc = extract_features(df)
-        train_and_save_model(X, y, enc, model_path, encoder_path)
-
-    # 7) Optional inference
-    #if model_path and encoder_path and not train_model_flag:
-        if model_path.exists() and encoder_path.exists():
-            df = load_and_apply_model(df, model_path, encoder_path)
-        else:
-            logger.warning("Model or encoder missing; skipping ML inference")
-
-    # 8) Export to Excel
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="results", index=False)
-    logger.info("Exported results to %s", output_path)
-
-    return df
+        # 4) Retrain
+    # Ensure that the parent directory (where dedupe_pipeline.py lives) is on the path
+    sys.path.insert(0, str(Path(__file__).parent))
+    from dedupe_pipeline import extract_features
+    retrain_model_with_labels(
+        merged_df=merged,
+        feature_extractor=extract_features,
+        model_path=root / 'models' / 'rf_model.joblib',
+        encoder_path=root / 'models' / 'label_encoder.joblib'
+    )
