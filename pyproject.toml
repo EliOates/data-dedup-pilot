@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.20"]
+build-backend = "hatchling.build"
+
+[project]
+name = "contact-dedupe"          # you can rename later
+version = "0.1.0"
+description = "Contact deduplication and ML-assisted cleansing pipeline"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name="Your Name"}]
+
+dependencies = [
+  "pandas>=2.1",
+  "rapidfuzz>=3.8",
+  "scikit-learn>=1.3",
+  "openpyxl>=3.1",
+  "typer>=0.12",
+  "tenacity>=8.2",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "mypy>=1.10", "ruff>=0.5", "black>=24.4", "pre-commit>=3.7"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/contact_dedupe"]
+
+[project.scripts]
+dedupe = "contact_dedupe.cli:app"
